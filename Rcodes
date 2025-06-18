@@ -1,0 +1,639 @@
+######## ######## ######## ######## ######## ######## ######## ######## ######## ######## ######## 
+######## ######## ########  Disaggregation Regression ######## ######## ######## ######## ########  
+######## ######## ######## ######## ######## ######## ######## ######## ######## ######## ######## 
+## Loading Libraries
+library(corrr, moments)
+library(maps)
+library(geosphere)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(rworldmap)
+library(data.table)
+library(ggthemes)
+library(airportr)
+library(hrbrthemes)
+library(ggplot2)
+library(lubridate)
+library(paletteer)
+library(RColorBrewer)
+library(data.table)
+library(readr)
+library(MMWRweek)
+library(scales)
+library(showtext)
+library(sysfonts)
+library(sf)
+library(rnaturalearth)
+library(janitor)
+library(raster)
+library(viridis)
+library(ggnewscale)
+library(ggrepel)
+library(ggplot2)
+library(hrbrthemes)
+#install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+#install.packages("TMB", type= 'source')
+library(INLA)
+library(TMB)
+library(disaggregation)
+library(SpatialEpi)
+library(dplyr)
+library(disaggregation)
+library(ggplot2)
+library(sf)
+library(terra)
+library(ggridges)
+library(hrbrthemes)
+library(stringi)  # Load the package
+library(blockCV)
+######## Creating a Loop for the Cross Validation Technique
+
+# Read in your country shapefiles 
+Epi.shp.1ctry <- st_read("Shapefiles/--.shp")
+
+# Convert polygons to centroids
+Epi.shp.1ctry <- Epi.shp.1ctry %>%
+  mutate(centroid = st_centroid(geometry))
+# Extract centroid coordinates for clustering
+coords <- st_coordinates(Epi.shp.1ctry$centroid)
+# Perform k-means clustering (grouping nearby polygons together)
+set.seed(123)  # For reproducibility
+kmeans_result <- kmeans(coords, centers = 3, nstart = 35)  # 5 folds
+# Assign cluster IDs as fold IDs
+Epi.shp.1ctry$block_id <- kmeans_result$cluster
+ggplot() + geom_sf(data = Epi.shp.1ctry, aes(fill = block_id))
+
+## Covaritaes 
+all.cov <- rast("Covariateslayers")
+pop.count <- rast("Popoulation_count")
+
+#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
+#### Loop 
+#### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### 
+##
+# List of covariate sets to loop over
+covariate_list <- list(
+  All_Covariate = all.cov ## Add any other combination of covariates here 
+)
+
+final_results <- list()
+
+# Loop over each covariate set
+for(cov_set in names(covariate_list)){
+  
+  # Set the current covariate raster
+  current_cov_raster <- covariate_list[[cov_set]]
+  
+  cv_results <- list()
+  
+  # Loop over each block for cross-validation
+  for (current_block in unique(Epi.shp.1ctry$block_id)) {
+    
+    # Split the data into training and testing sets
+    train_data <- Epi.shp.1ctry %>% filter(block_id != current_block)
+    test_data  <- Epi.shp.1ctry %>% filter(block_id == current_block)
+    
+    # Crop the covariate raster for training and testing
+    train_cov <- terra::crop(current_cov_raster, train_data, mask = TRUE)
+    test_cov  <- terra::crop(current_cov_raster, test_data, mask = TRUE)
+    
+    # Example: cropping an aggregation raster if needed
+    Agg.pop.count <- terra::crop(pop.count.resample, train_data, mask = TRUE)
+    
+    # Prepping model parameters based on training data
+    max.edge <- diff(range(st_coordinates(train_data)[,1])) / (3*5)
+    bound.outer <- diff(range(st_coordinates(train_data)[,1])) / 3
+    
+    # Prepare the training data for the model (using your custom prepare_data function)
+    train_data_for_model <- prepare_data(
+      polygon_shapefile = train_data,
+      covariate_rasters = train_cov,
+      aggregation_raster = Agg.pop.count,
+      response_var = 'Tdcases_2019',
+      id_var = 'NAME_2',
+      na.action = TRUE,
+      mesh.args = list(cut = max.edge/5,
+                       max.edge = c(1, 2) * max.edge)
+    )
+    
+    # Fit the model (using your custom disag_model function)
+    model_result <- disag_model(
+      train_data_for_model,
+      iterations = 100000,
+      family = 'poisson',
+      link = 'log',
+      priors = list(
+        priormean_intercept = 0,
+        priorsd_intercept = 2,
+        priormean_slope = 0.0,
+        priorsd_slope = 0.4,
+        prior_rho_min = 3,
+        prior_rho_prob = 0.01,
+        prior_sigma_max = 1,
+        prior_sigma_prob = 0.01,
+        prior_iideffect_sd_max = 0.05,
+        prior_iideffect_sd_prob = 0.01
+      )
+    )
+    
+    # Predict using the test data and pop 
+    
+    # Predict using the test data
+    test_pop <- terra::crop(pop.count,test_data, mask=T)
+    model_prediction <- predict(model_result, newdata = test_cov)
+    predicted_cases <- raster::extract(model_prediction$mean_prediction$prediction *test_pop  , test_data, fun = sum, na.rm = TRUE)
+    
+  
+    # Save results for this block
+    cv_results[[paste0("Fold_", current_block)]] <- list(
+      test_data = test_data,
+      predictions = predicted_cases
+    )
+  }
+  
+  # Combine results from all folds
+  combined_results <- cv_results %>% 
+    map_dfr(~data.frame(
+      test_data = .x$test_data,
+      predictions = .x$predictions
+    ))
+  
+  # Compute correlations between observed and predicted values, grouped by block_id
+  correlations <- combined_results %>%
+    group_by(test_data.block_id) %>%
+    filter(n() >= 3) %>%  # Keep only groups with 3 or more rows
+    summarize(correlation = cor(test_data.Tdcases_2019, predictions.sum, use = "complete.obs"))
+  
+  block_corr_mean <- mean(correlations$correlation, na.rm = TRUE)
+  
+  # Store the results for the current covariate set
+  final_results[[cov_set]] <- list(
+    combined_results = combined_results,
+    correlations = correlations,
+    block_corr_mean = block_corr_mean
+  )
+}
+
+# Inspect final_results to compare performance across covariate sets
+final_results
+
+)
+
+correlation_overall <- cor(combined_results$test_data.Td_2019/combined_results$test_data.pp_cnt_ , 
+                           combined_results$predictions.sum/combined_results$test_data.pp_cnt_, method="spearman",use = "complete.obs")
+
+correlation_by_group <- combined_results %>% 
+  group_by(test_data.block_id) %>% 
+  summarise(correlation= cor((log10(test_data.Td_2019/test_data.pp_cnt_)*100000),
+                             log10((predictions.sum/test_data.pp_cnt_)*100000), use = "complete.obs", method="spearman"),
+            correlation2= cor(test_data.Td_2019/test_data.pp_cnt_,predictions.sum/test_data.pp_cnt_, method="spearman", use = "complete.obs"),
+            cor.p = cor.test((log10(test_data.Td_2019/test_data.pp_cnt_)*100000),
+                             log10((predictions.sum/test_data.pp_cnt_)*100000), use = "complete.obs", method="spearman")$p.value,
+            cor.p2 = cor.test(test_data.Td_2019/test_data.pp_cnt_,predictions.sum/test_data.pp_cnt_, method="spearman", use = "complete.obs")$p.value)
+
+
+
+#####################################################################
+
+#### #### #### #### 
+### Figure 1 
+#### #### #### #### 
+#### For plotting purporses it might be better to plot admin level 1 
+
+Countries.14 <- st_read("Shapefiles/Countries_14.shp")
+plot(Countries.14["Tdcases_2019"], border=NA, col= paletteer_c("ggthemes::Sunset-Sunrise Diverging", 30))
+Countries.14$Tdcases_2019 <- as.numeric(Countries.14$Tdcases_2019)
+Countries_merged <- Countries.14 %>%
+  group_by(COUNTRY,NAME_1) %>%
+  summarise(Tdcases_2019 = sum(Tdcases_2019, na.rm = TRUE), .groups = "drop")
+
+## Shapefile- Amind level 1 for plotting and cropping 
+world <- st_read("Shapefiles/CentralAmerica-boundaries/world-administrative-boundaries.shp")
+central_south_america <- c("Argentina", "Belize", "Bolivia", "Brazil", "Chile", 
+                           "Colombia", "Costa Rica", "Cuba", "Dominican Republic", 
+                           "Ecuador", "El Salvador", "French Guiana", "Guatemala", 
+                           "Guyana", "Haiti", "Honduras", "Jamaica", "Mexico", 
+                           "Nicaragua", "Panama", "Paraguay", "Peru", "Suriname", 
+                           "Trinidad and Tobago", "Uruguay", "Venezuela")
+central_south_america.shp <- world %>% 
+  filter(name %in% c(central_south_america))
+
+#### DAta with case numbers 
+#epi.data.shp <- st_read("Results/Data_to_model.shp")
+epi.data.shp <- st_read("Results/CSA_cases_shapefile/CSA_Shap_withcases.shp")
+epi.data.shp$norma_Td_2019 <- (epi.data.shp$Td_2019 / epi.data.shp$pp_cnt_)*100000
+epi.data.shp$pred_norma_Td_cases <- (epi.data.shp$prd_c_2 / epi.data.shp$pp_cnt_)*100000
+epi.data.shp$pred_norma_Td_cases_smaller <- (epi.data.shp$prd_css / epi.data.shp$pp_cnt_)*100000
+
+cor.test(epi.data.shp$pred_norma_Td_cases, epi.data.shp$norma_Td_2019, method = "spearman")
+
+### PLOT - Shapes 
+### Central and South America Predicted cases 
+ggplot() +
+  geom_sf(data=central_south_america.shp, fill="grey70")+
+  #geom_sf(data=epi.data.shp , aes(fill=log10(pred_norma_Td_cases+1)), col=NA)+
+  geom_sf(data=epi.data.shp , aes(fill=(pred_norma_Td_cases+1)), col=NA)+
+  scale_fill_gradientn(colors = paletteer_c("viridis::plasma", 30),
+                       #colors = paletteer_c("ggthemes::Sunset-Sunrise Diverging", 30),
+                       name="Incidence\n(Cases per 100k\npeople)\n ",
+                       breaks= c(0,1,2,3,4,5),
+                       limits = c(0, 5),
+                       trans="log10",
+                       labels = c("0", "10", "100", "1K", "10K", "100k"),
+                       guide = guide_colorbar(
+                         barheight = unit(8, "cm"),
+                         barwidth = unit(0.5, "cm")))+
+  geom_sf(data=central_south_america.shp, fill=NA, colour="white")+
+  theme_void()+
+  theme(legend.position=c(0.2,0.3),
+        legend.text = element_text(size=16, face="bold"),
+        legend.title = element_text(size=18, face="bold"))
+
+csa.inc.and.rate <- crop(world.inc.and.rate,central_south_america.shp, mask=T)
+
+##### #### High reolsution csa map Figure 1B - 
+## Getting the incidence prediction map 
+
+## Population Count 
+pop.count <- rast("Data/Predictors/Pop_density/gpw_v4_population_count_rev11_2020_2pt5_min.tif")
+## Predicted Incidence Map 
+World.dis.reg <- rast("Results/Result_pred_stacks_world.tif")
+World.dis.reg <- World.dis.reg[[1]]
+pop.count.res <- resample(pop.count,World.dis.reg)
+World.dis.reg.inc <- World.dis.reg*pop.count.res
+world.inc.and.rate <- c(World.dis.reg,World.dis.reg.inc)
+
+### Plotting world map 
+ggplot() +
+  geom_raster(data=as.data.frame(World.dis.reg.inc, xy=T, na.rm=T), aes(x=x,y=y, fill=((((`Mean Prediction`))))))+
+  geom_sf(data=world, fill=NA, col="black")+
+  scale_fill_gradientn(colors = paletteer_d("RColorBrewer::YlGnBu"),name="Cases",
+                       #labels = c( "5", "30","120", "340","800"),
+                       #breaks= c(0,1,2,3,4,5),
+                       trans = "log1p",#pseudo_log_trans(sigma = 10),
+                       #limits = c(0, 5),
+                       guide = guide_colorbar(
+                         barheight = unit(8, "cm"),
+                         barwidth = unit(0.5, "cm")))+
+  theme_linedraw()+
+  theme(legend.text = element_text(size=16, face="bold"),
+        legend.title = element_text(size=18, face="bold"))
+
+
+
+
+
+## Cropping for Central and South America (CSA) 
+csa.inc.and.rate <- crop(world.inc.and.rate,central_south_america.shp, mask=T)
+
+ggplot() +
+  geom_raster(data=as.data.frame(csa.inc.and.rate[[2]], xy=T, na.rm=T), aes(x=x,y=y, fill=(sqrt(sqrt(`Mean Prediction`)))))+
+  geom_sf(data=central_south_america.shp, fill=NA, col="white")+
+  geom_sf(data=central_south_america.shp %>% filter(name %in% c("Uruguay", "Cuba", "Jamaica", "Chile", "Guyana",
+                                                                "Suriname", "Belize","El Salvador","French Guiana","Dominican Republic",
+                                                                "Haiti")), fill="grey60", col="white")+
+  scale_fill_gradientn(colors = paletteer_c("viridis::plasma", 30),name="Incidence",
+                       labels = c("0", "5", "30","120", "340","800"),
+                       #breaks= c(0,1,2,3,4,5),
+                       trans = "log1p",#pseudo_log_trans(sigma = 10),
+                       #limits = c(0, 5),
+                       guide = guide_colorbar(
+                         barheight = unit(8, "cm"),
+                         barwidth = unit(0.5, "cm")))+
+  theme_void()+
+  theme(legend.text = element_text(size=16, face="bold"),
+        legend.title = element_text(size=18, face="bold"))
+
+
+## Incidence (per 100k inhabitants)
+ggplot() +
+  geom_raster(data=as.data.frame(csa.inc.and.rate[[1]], xy=T, na.rm=T), aes(x=x,y=y, fill=(((`Mean Prediction`*100000)))))+
+  geom_sf(data=central_south_america.shp, fill=NA, col="white")+
+  geom_sf(data=central_south_america.shp %>% 
+            filter(name %in% c("Uruguay", "Cuba", "Jamaica", "Chile", "Guyana",
+                               "Suriname", "Belize","El Salvador","French Guiana","Dominican Republic",
+                               "Haiti")), fill="grey60", col="white")+
+  scale_fill_gradientn(colors = paletteer_c("viridis::plasma", 30),
+                       name="Predicted Incidence\n(Cases per 100k\ninhabitants)",
+                       #labels = c("0", "5", "30","120", "340","800"),
+                       #breaks= c(0,1,2,3,4,5),
+                       trans = "sqrt",#pseudo_log_trans(sigma = 10),
+                       #limits = c(0, 5),
+                       guide = guide_colorbar(
+                         barheight = unit(8, "cm"),
+                         barwidth = unit(0.5, "cm")))+
+  theme_void()+
+  theme(legend.position= c(0.2,0.3),
+        legend.text = element_text(size=16, face="bold"),
+        legend.title = element_text(size=18, face="bold"))
+
+##### #### ##### ####
+#### Figure 2
+##### ######### ####
+Africa.country.shp <- st_read("Shapefiles/Africa_C/afr_g2014_2013_0.shp")
+
+## Plotting for Africa 
+pop.count.Africa <- terra::crop(pop.count.res, Africa, mask=T)
+Rast.compare.stack.Africa <- rast("Results/All_risk_maps_Africa.tif")
+
+Africa_TP_plot <- ggplot()+
+  geom_raster(data= as.data.frame(Rast.compare.stack.Africa[[4]],xy=T, na.rm=T),aes(x=x,y=y, fill=((Predicted_Incidence+1))))+
+  scale_fill_gradientn(colors=(paletteer_d("RColorBrewer::YlGnBu")), 
+                       #breaks=c(0,1,2,3,4),
+                       trans = "log1p",#pseudo_log_trans(sigma = 10),
+                       #labels=c("0","25","50","75","100"," "),
+                       #limits=c(0,125),
+                       guide = guide_colorbar(barheight = unit(8, "cm"),barwidth = unit(0.5, "cm"))) +
+  geom_sf(data=Africa, fill=NA)+
+  #geom_sf_text(data=Africa,aes(label = ISO3))+
+  theme_void()+
+  labs(fill="Cases")+
+  theme(legend.position = "left",
+        legend.direction = "vertical",
+        legend.title.position = "top",
+        legend.text = element_text(size=16, face="bold"),
+        legend.title = element_text(size=18, face="bold"))
+
+Africa_TP_plot
+
+## Plotting normalised incidence per 100k inhabitants - high resolution plot
+
+Africa_TP_plot_normalised <- ggplot()+
+  geom_raster(data= as.data.frame(Rast.compare.stack.Africa[[6]],xy=T, na.rm=T),
+              aes(x=x,y=y, fill=(((Predicted_Incidence_Rate+1)*100000))))+
+  scale_fill_gradientn(colors=(paletteer_d("RColorBrewer::YlGnBu")), 
+                       #breaks=c(0,1,2,3,4),
+                       trans = "log10",#pseudo_log_trans(sigma = 10),
+                       labels= c("0","500","1000","1500", "2000", " "),
+                       #limits=c(0,125),
+                       guide = guide_colorbar(barheight = unit(8, "cm"),barwidth = unit(0.5, "cm"))) +
+  geom_sf(data=Africa, fill=NA)+
+  #geom_sf_text(data=Africa,aes(label = ISO3))+
+  theme_void()+
+  labs(fill="Incidence\n(Cases per 100k\npeople)")+
+  theme(legend.position =  c(0.2, 0.35),
+        legend.direction = "vertical",
+        legend.title.position = "top",
+        legend.text = element_text(size=16, face="bold"),
+        legend.title = element_text(size=18, face="bold"))
+
+Africa_TP_plot_normalised
+
+### Reaggretaing to country level 
+Africa_pred_inc <- extract(Rast.compare.stack.Africa[[4]],Africa, fun= sum,na.rm=T)
+Africa$Pred_Incidence <- Africa_pred_inc$Predicted_Incidence
+pop.count.Africa_extract <- extract(pop.count.Africa, Africa, fun=sum,na.rm=T)
+Africa$Pop_count <- pop.count.Africa_extract$gpw_v4_population_count_rev11_2020_2pt5_min
+Africa_pred_inc_rate <- extract(Rast.compare.stack.Africa[[6]],Africa, fun= mean,na.rm=T)
+Africa$Pred_Incidence_normalised <- (Africa_pred_inc_rate$Predicted_Incidence_Rate) *100000
+
+Africa_country_cases <- ggplot()+
+  geom_sf(data=Africa, aes(fill=Pred_Incidence_normalised))+
+  scale_fill_gradientn(colors=paletteer_d("RColorBrewer::YlGnBu"),  
+                       #labels=c(" ", "100","200","300","400"),
+                       guide = guide_colorbar(barheight = unit(8, "cm"),barwidth = unit(0.5, "cm"))) +
+  #geom_sf(data=Africa, fill=NA)+
+  geom_sf_text(data=Africa,aes(label = ISO3), colour="#c44900",size=4, fontface="bold")+
+  theme_void()+
+  labs(fill="Incidence\n(Cases per 100k\npeople)")+
+  theme(legend.position = c(0.25, 0.35),
+        legend.direction = "vertical",
+        legend.title.position = "top",
+        
+        legend.text = element_text(size=16, face="bold"),
+        legend.title = element_text(size=18, face="bold"))
+Africa_country_cases
+
+## Just to get names of each african country
+ggplot()+
+  geom_sf(data=Africa, fill="#f0f0f0")+
+  #geom_sf(data=Africa, fill=NA)+
+  geom_sf_text(data=Africa,aes(label = ISO3))+
+  theme_void()+
+  #labs(fill="Incidence\n(Cases per 100k\npeople)")+
+  theme(legend.position = c(0.2, 0.3),
+        legend.direction = "vertical",
+        legend.title.position = "top",
+        legend.text = element_text(size=16, face="bold"),
+        legend.title = element_text(size=18, face="bold"))
+
+
+
+
+## Plotting using BASE R
+plot(Rast.compare.stack.Africa[[1]], 
+     col=rev(paletteer_c("ggthemes::Classic Orange-Blue", 30)),
+     box = FALSE, axes=F)
+## Zooomed in 
+MRU <- Africa %>% filter(ADM0_NAME=="Mauritius")
+shp_parts <- MRU %>%
+  mutate(orig_id = row_number()) %>%
+  st_cast("POLYGON")
+
+# Calculate area for each part
+shp_parts <- shp_parts %>%
+  mutate(area = st_area(.))
+
+# Keep only the largest polygon per original feature
+shp_largest <- shp_parts %>%
+  group_by(orig_id) %>%
+  slice_max(order_by = area, n = 1) %>%
+  ungroup() %>%
+  dplyr::select(-area, -orig_id)
+
+plot(crop(Rast.compare.stack.Africa[[1]], shp_largest, mask=T))
+plot(crop(Rast.compare.stack.Africa[[1]], Africa %>% filter(ADM0_NAME=="Sao Tome and Principe"), mask=T))
+
+########### ########### ########### ########### ###########
+########### Aggregating incidence to every admin level of Africa 
+########### ########### ########### ########### ###########
+
+#Africa.cities.point <- st_read("Shapefiles/Africa_Cities/Africa_Cities.shp")
+Africa.admin1 <- st_read("Shapefiles/shapefile_admine_level1_africa/959cf709-3b35-4278-b297-a7442cdc37d0/afr_g2014_2013_1.shp")
+ggplot() + geom_sf(data=Africa.admin1)
+
+#Extracting population for each of those admin1
+Africa.adm1.popcount <- extract(pop.count,Africa.admin1, fun=sum, na.rm=T)
+Africa.admin1$pop_count <- Africa.adm1.popcount$gpw_v4_population_count_rev11_2020_2pt5_min
+
+## Extracting the predicted incidence per admin level 
+
+Africa_pred_inc_admin1 <- extract(Rast.compare.stack.Africa[[6]],Africa.admin1, fun= mean,na.rm=T)
+Africa.admin1$Pred_Incidence_rate <- Africa_pred_inc_admin1$Predicted_Incidence_Rate
+Africa.admin1$Pred_Incidenceper100k <- (Africa.admin1$Pred_Incidence_rate)*100000
+
+
+Africa_admin1_cases <- ggplot()+
+  geom_sf(data=Africa.admin1 , aes(fill=Pred_Incidenceper100k))+
+  scale_fill_gradientn(colors=paletteer_d("RColorBrewer::YlGnBu"),  guide = guide_colorbar(
+    barheight = unit(8, "cm"),
+    barwidth = unit(0.5, "cm"),
+    name="Incidence\n(Cases per 100k\npeople)\n "))+
+    #breaks= c(0,1,2,3,4,5),
+    #limits = c(0, 5),
+    #labels = c("0", "10", "100", "1K", "10K", "100k") )) +
+  #geom_sf_text(data=Africa.admin1 %>% filter(ADM0_NAME=="Togo"), aes(label = ADM1_NAME), colour="#b5838d")+
+  geom_sf(data=Africa.country.shp, fill=NA, col="#bc4749")+
+  #geom_sf(data=Africa, fill=NA)+
+  #geom_sf_text(data=Africa,aes(label = ISO3))+
+  theme_void()+
+  labs(fill="Incidence\n(Cases per 100k\npeople)")+
+  theme(legend.position = c(0.2, 0.3),
+        legend.direction = "vertical",
+        legend.title.position = "top",
+        legend.text = element_text(size=16, face="bold"),
+        legend.title = element_text(size=18, face="bold"))
+Africa_admin1_cases
+
+###### ###### ###### 
+###### Zooming in into specific countries ###### 
+Africa.admin1 <- Africa.admin1[-375,]
+
+Ethiopia_admin1_plot <- ggplot()+
+  geom_sf(data=Africa.admin1 %>% filter(ADM0_NAME == "Burundi"), aes(fill=Pred_Incidenceper100k), show.legend = T)+
+  scale_fill_gradientn(colors=paletteer_d("RColorBrewer::YlGnBu"),  guide = guide_colorbar(
+    barheight = unit(8, "cm"),
+    barwidth = unit(0.5, "cm"),
+    name="Incidence\n(Cases per 100k\npeople)\n "))+
+  #breaks= c(0,1,2,3,4,5),
+  #limits = c(0, 47))+
+  #labels = c("0", "10", "100", "1K", "10K", "100k") )) +
+  #geom_sf(data=Africa.country.shp %>% filter(ADM0_NAME == "Burundi"), fill=NA, col="#bc4749")+
+  #geom_sf(data=Africa, fill=NA)+
+  geom_sf_text(data=Africa.admin1 %>% filter(ADM0_NAME == "Burundi"),
+               aes(label = ADM1_NAME),size=7, colour="#bc4749")+
+  theme_void()+
+  labs(fill="Incidence\n(Cases per 100k\npeople)", title="Burundi")+
+  theme(legend.position = c(0.1, 0.75),
+        legend.direction = "vertical",
+        legend.title.position = "top",
+        plot.title = element_text(size=22, hjust=0.5, face="bold"),
+        legend.text = element_text(size=16, face="bold"),
+        legend.title = element_text(size=18, face="bold"))
+Ethiopia_admin1_plot
+
+
+Africa_pred_cases_admin1 <- extract(Rast.compare.stack.Africa[[4]],Africa.admin1, fun= sum,na.rm=T)
+Africa.admin1$pred_cases <- Africa_pred_cases_admin1$`Predicted Incidence`
+
+PredCases_admin1_plot <- ggplot()+
+  geom_sf(data=Africa.admin1 %>% filter(ADM0_NAME == "Rwanda"), aes(fill=pred_cases), show.legend = T)+
+  scale_fill_gradientn(colors=paletteer_d("RColorBrewer::YlGnBu"),  guide = guide_colorbar(
+    barheight = unit(8, "cm"),
+    barwidth = unit(0.5, "cm"),
+    name="Incidence\n(Cases per 100k\npeople)\n "),
+    #breaks= c(0,1,2,3,4,5),
+    limits = c(0, 300))+
+  #labels = c("0", "10", "100", "1K", "10K", "100k") )) +
+  #geom_sf(data=Africa.country.shp %>% filter(ADM0_NAME == "Rwanda"), fill=NA, col="#bc4749")+
+  #geom_sf(data=Africa, fill=NA)+
+  geom_sf_text(data=Africa.admin1 %>% filter(ADM0_NAME == "Rwanda"),
+               aes(label = ADM1_NAME),size=7, colour="#bc4749")+
+  theme_void()+
+  labs(fill="Incidence\n(Cases per 100k\npeople)", title="Rwanda")+
+  theme(legend.position = c(1, 0.9),
+        legend.direction = "vertical",
+        legend.title.position = "top",
+        plot.title = element_text(size=22, hjust=0.5, face="bold"),
+        legend.text = element_text(size=16, face="bold"),
+        legend.title = element_text(size=18, face="bold"))
+PredCases_admin1_plot
+
+
+
+
+
+
+
+##### Plotting individual plots (all other risk maps)
+# Function to normalize one layer by its own max
+normalize_max <- function(r) {
+  max_val <- minmax(r)[2]
+  r / max_val
+}
+
+# Apply to each layer in the stack
+r_stack_maxnorm <- rast(lapply(1:nlyr(Rast.compare.stack.Africa), function(i) normalize_max(Rast.compare.stack.Africa[[i]])))
+names(r_stack_maxnorm) <- names(Rast.compare.stack.Africa)
+
+##Trying to preserve the incidence data - ONLY FOR INCIDENCE
+log_transformed <- log1p(Rast.compare.stack.Africa[[4]])  # log(1 + x) to preserve zeros
+max_val <- minmax(log_transformed)[2]
+normalized_log <- log_transformed / max_val
+
+### with different colours 
+par(cex = 1.1, font=2)
+plot(r_stack_maxnorm[[1]], 
+     col=rev(paletteer_c("ggthemes::Classic Orange-Blue", 30)),
+     box = FALSE, axes=F, main= "Transmission Potential" )
+
+plot(r_stack_maxnorm[[5]], 
+     col=paletteer_c("ggthemes::Sunset-Sunrise Diverging", 30),
+     box = FALSE, axes=F,main= "Dengue Suitability Index" )
+
+plot(r_stack_maxnorm[[3]], 
+     col=paletteer_c("grDevices::Viridis", 30),
+     box = FALSE, axes=F,main= "Vector Suitability Index" )
+
+plot(r_stack_maxnorm[[4]], 
+     col=paletteer_c("ggthemes::Sunset-Sunrise Diverging", 30),
+     box = FALSE, axes=F,main= "Predicted Incidence" )
+
+plot(normalized_log, col=paletteer_c("ggthemes::Sunset-Sunrise Diverging", 30),
+     box = FALSE, axes=F, main="Predicted Incidence" )
+plot(Africa.country.shp, add = TRUE, col = NA, border = "white",lwd=0.1)
+
+plot((Rast.compare.stack.Africa[[6]]*100000), col=paletteer_c("ggthemes::Sunset-Sunrise Diverging", 30),
+     box = FALSE, axes=F, main="Predicted Incidence" , cex=2 )
+plot(Africa.country.shp, add = TRUE, col = NA, border = "white",lwd=0.05)
+
+ggplot()+
+  geom_raster(data= as.data.frame(Rast.compare.stack.Africa[[6]],xy=T, na.rm=T),
+              aes(x=x,y=y, fill=(sqrt(Predicted_Incidence_Rate+1)*100000)))+
+  scale_fill_gradientn(colors=(paletteer_c("ggthemes::Sunset-Sunrise Diverging", 30)), 
+                       #breaks=c(0,1,2,3,4),
+                       #trans = "log1p",#pseudo_log_trans(sigma = 10),
+                       #labels= c("0","500","1000","1500", "2000", " "),
+                       #limits=c(0,125),
+                       guide = guide_colorbar(barheight = unit(8, "cm"),barwidth = unit(0.5, "cm"))) +
+  geom_sf(data=Africa, fill=NA, colour="white")+
+  #geom_sf_text(data=Africa,aes(label = ISO3))+
+  theme_void()
+
+###############################################
+Dengue_OBrady <- rast("Results/DEN_riskmap_upr_masked_Brady.tif")
+
+Dengue_OBrady.Africa <- terra::crop(Dengue_OBrady, Africa.country.shp, mask=T)
+Dengue_OBrady.Africa.resampled <- resample(Dengue_OBrady.Africa,Rast.compare.stack.Africa)
+Rast.compare.stack.Africa[[5]] <- Dengue_OBrady.Africa.resampled
+
+###### ###### ###### ###### ###### ###### ###### 
+## Plotting all the risk maps together on a single scale
+## African shapefile
+Africa.country.shp <- st_read("Shapefiles/Africa_C/afr_g2014_2013_0.shp")
+names(Rast.compare.stack.Africa[[c(1,5,3,4)]]) <- c("Transmission Potential", "Dengue Suitability Index", "Vector Suitability Index","Predicted Incidence")
+
+Rast.compare.stack.Africa$sqrt_cases <- sqrt(sqrt(Rast.compare.stack.Africa[[4]]))
+### Plotting all the maps with similar colour scale
+plot(Rast.compare.stack.Africa[[c(1,5,3,4)]], 
+     col=paletteer_c("ggthemes::Sunset-Sunrise Diverging", 30),
+     box = FALSE, axes=F, cex=2 )
+plot(Africa.country.shp, add=T, col=NA)
+
+par(mfrow = c(2, 2),cex=1.2, font=2)  # adjust to match number of layers
+for (i in c(1, 5, 3, 8)) {
+  plot(Rast.compare.stack.Africa[[i]],
+       col = paletteer::paletteer_c("ggthemes::Sunset-Sunrise Diverging", 30),
+       box = FALSE, axes = FALSE,
+       main = names(Rast.compare.stack.Africa)[i])
+  #plot(Africa.country.shp, add = TRUE, col = NA, border = "white",lwd=0.05)
+}
+par(mfrow = c(1, 1),cex=1.2, font=2)  # reset layout
+
+legend("bottom", fill=paletteer::paletteer_c("ggthemes::Sunset-Sunrise Diverging", 30),
+       legend= c())
+
+
+
+
